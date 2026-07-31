@@ -7,6 +7,9 @@ import json
 import random
 import sys
 from pathlib import Path
+import glob
+import os
+import shutil
 
 import numpy as np
 import torch
@@ -15,6 +18,7 @@ from PIL import Image
 from torch import nn
 from torch.optim import AdamW, SGD
 from torch.utils.data import ConcatDataset, DataLoader, Subset, WeightedRandomSampler
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve()
 TEXTFAENET_ROOT = ROOT.parents[1]
@@ -24,13 +28,11 @@ if str(TEXTFAENET_ROOT) not in sys.path:
 from src.data import MosMed2DSegmentationDataset, MosMedTextCSVDataset, PromptedFolderSegmentationDataset
 from src.models import LFAENetTGFSv2, FAENet
 
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 class SegLoss(nn.Module):
     def __init__(
@@ -66,8 +68,6 @@ class SegLoss(nn.Module):
 
     @staticmethod
     def pooled_dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        # Pool ALL pixels in the batch before computing Dice — optimises the same
-        # global-Dice metric that FMISeg/LViT report, where large lesions dominate.
         probs = torch.sigmoid(logits)
         inter = (probs * targets).sum()
         denom = probs.sum() + targets.sum()
@@ -82,9 +82,6 @@ class SegLoss(nn.Module):
         gamma: float = 1.3333,
         eps: float = 1e-6,
     ) -> torch.Tensor:
-        # Tversky index with separate FP/FN weighting. alpha<beta penalises false
-        # negatives harder, raising recall on the tiny/scattered lesions that drag
-        # per-image Dice down; gamma>1 focuses learning on hard (low-overlap) cases.
         probs = torch.sigmoid(logits)
         tp = (probs * targets).sum(dim=(1, 2, 3))
         fp = (probs * (1.0 - targets)).sum(dim=(1, 2, 3))
@@ -95,7 +92,6 @@ class SegLoss(nn.Module):
     @staticmethod
     def boundary_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
-        # Morphological gradient: Dilation - Erosion
         pred_dilated = F.max_pool2d(probs, kernel_size=3, stride=1, padding=1)
         pred_eroded = -F.max_pool2d(-probs, kernel_size=3, stride=1, padding=1)
         pred_boundary = pred_dilated - pred_eroded
@@ -189,14 +185,12 @@ class TextSegCollator:
         texts = [str(x.get("text", "")) for x in batch]
         texts = self._apply_prompt_mode(texts)
         names = [x["mask_name"] for x in batch]
-
         out = {
             "image": images,
             "mask": masks,
             "text": texts,
             "mask_name": names,
         }
-
         if self.tokenizer is not None:
             toks = self.tokenizer(
                 texts,
@@ -207,9 +201,7 @@ class TextSegCollator:
             )
             out["input_ids"] = toks["input_ids"]
             out["attention_mask"] = toks["attention_mask"]
-
         return out
-
 
 def create_model(args, device: torch.device):
     model_type = getattr(args, "model_type", "lfaenet_tgfs_v2")
@@ -257,12 +249,6 @@ def create_model(args, device: torch.device):
             image_backbone_weights=getattr(args, "image_backbone_weights", "imagenet"),
             radimagenet_ckpt=getattr(args, "radimagenet_ckpt", None),
         )
-
-    # Always load a tokenizer for text-based models.
-    # The CXR-BERT tokenizer is used purely for tokenization regardless of
-    # whether the CXR-BERT backbone itself is used (SimpleTextEncoder also
-    # needs integer token_ids — it just learns its own embeddings from scratch).
-    from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.cxr_bert_dir,
@@ -336,12 +322,10 @@ def compute_foreground_stats(
         "median_area": float(np.median(areas)) if areas else 0.0,
     }
 
-
 def auto_pos_weight_from_stats(stats: dict[str, float], max_pos_weight: float) -> float:
     fg = max(stats["fg_fraction"], 1e-6)
     neg = max(1.0 - fg, 1e-6)
     return min(neg / fg, max_pos_weight)
-
 
 def parse_thresholds(spec: str) -> list[float]:
     values = [float(x.strip()) for x in spec.split(",") if x.strip()]
@@ -349,7 +333,6 @@ def parse_thresholds(spec: str) -> list[float]:
     if not values:
         raise ValueError("No valid thresholds parsed; expected comma-separated values in (0,1).")
     return values
-
 
 def compute_loss_with_aux(
     criterion,
@@ -380,7 +363,6 @@ def compute_loss_with_aux(
         loss = loss + grounding_loss_weight * grounding / len(gmap)
     return loss
 
-
 def forward_model(batch, model, args, device: torch.device):
     image = batch["image"].to(device, non_blocking=True)
     mask = batch["mask"].to(device, non_blocking=True)
@@ -405,13 +387,10 @@ def forward_model(batch, model, args, device: torch.device):
 
     return mask, logits, aux
 
-
 def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=None, threshold: float = 0.5):
-    from tqdm import tqdm
-
+    # from tqdm import tqdm
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
-
     total_loss = 0.0
     total_iou = 0.0
     total_dice = 0.0
@@ -424,7 +403,6 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
     accum_steps = max(1, int(args.grad_accum_steps))
     if train_mode:
         optimizer.zero_grad(set_to_none=True)
-
     phase = "train" if train_mode else "val"
     pbar = tqdm(enumerate(loader, start=1), total=len(loader), desc=f"  [{phase}]", leave=False, dynamic_ncols=True)
 
@@ -442,7 +420,6 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
                     args.aux_w_d2,
                     grounding_loss_weight=getattr(args, "grounding_loss_weight", 0.0),
                 )
-
             if train_mode:
                 scaled_loss = loss / accum_steps
                 max_grad_norm = float(getattr(args, "max_grad_norm", 0.0) or 0.0)
@@ -479,9 +456,7 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
         g_inter += (pred * mask).sum().item()
         g_pred_sum += pred.sum().item()
         g_gt_sum += mask.sum().item()
-
         pbar.set_postfix(loss=f"{loss.item():.4f}", dice=f"{m['dice']:.4f}", refresh=False)
-
     n = max(len(loader), 1)
     eps = 1e-6
     return {
@@ -490,16 +465,12 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
         "dice": total_dice / n,
         "pred_pos_ratio": total_pred_pos_ratio / n,
         "gt_pos_ratio": total_gt_pos_ratio / n,
-        "global_dice": (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps),
+        "micro_dice": (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps),
     }
 
 
 @torch.no_grad()
 def run_test_with_tta(model, loader, criterion, device, args, tokenizer, threshold: float):
-    """Evaluate test set with horizontal-flip TTA. Text is also l<->r swapped to
-    stay consistent with the flipped image. Original + flipped probabilities are
-    averaged, then re-thresholded.
-    """
     model.eval()
     total = {"loss": 0.0, "iou": 0.0, "dice": 0.0, "pred_pos_ratio": 0.0, "gt_pos_ratio": 0.0}
     n_batches = 0
@@ -508,11 +479,11 @@ def run_test_with_tta(model, loader, criterion, device, args, tokenizer, thresho
     g_gt_sum = 0.0
 
     for batch in loader:
-        # 1) Original forward
+        # Original forward
         mask, logits_orig, _ = forward_model(batch, model, args, device)
         probs_orig = torch.sigmoid(logits_orig)
 
-        # 2) Flip image + swap l/r in text + re-tokenize
+        # Flip image + swap l/r in text + re-tokenize
         flipped_image = torch.flip(batch["image"], dims=[-1])
         flipped_batch = {
             "image": flipped_image,
@@ -540,11 +511,10 @@ def run_test_with_tta(model, loader, criterion, device, args, tokenizer, thresho
         _, logits_flip, _ = forward_model(flipped_batch, model, args, device)
         probs_flip = torch.sigmoid(torch.flip(logits_flip, dims=[-1]))
 
-        # 3) Average probabilities then re-derive logits
+        # Average probabilities then re-derive logits
         avg_probs = 0.5 * (probs_orig + probs_flip)
         avg_probs = avg_probs.clamp(1e-7, 1.0 - 1e-7)
         avg_logits = torch.log(avg_probs / (1.0 - avg_probs))
-
         loss = criterion(avg_logits, mask).item()
         m = batch_metrics(avg_logits, mask, threshold=threshold)
         total["loss"] += loss
@@ -561,27 +531,25 @@ def run_test_with_tta(model, loader, criterion, device, args, tokenizer, thresho
     n = max(n_batches, 1)
     eps = 1e-6
     result = {k: v / n for k, v in total.items()}
-    result["global_dice"] = (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps)
+    result["micro_dice"] = (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps)
     return result
 
 
 @torch.no_grad()
 def evaluate_thresholds(
     model, loader, criterion, device, args, thresholds: list[float],
-    use_global_dice: bool = False,
+    use_micro_dice: bool = False,
 ) -> tuple[dict[float, dict[str, float]], float]:
     model.eval()
     eps = 1e-6
     results: dict[float, dict[str, float]] = {
-        thr: {"loss": 0.0, "iou": 0.0, "dice": 0.0, "global_dice": 0.0,
+        thr: {"loss": 0.0, "iou": 0.0, "dice": 0.0, "micro_dice": 0.0,
               "pred_pos_ratio": 0.0, "gt_pos_ratio": 0.0}
         for thr in thresholds
     }
-    # global-Dice accumulators (pooled across all pixels in the split)
     g_inter = {thr: 0.0 for thr in thresholds}
     g_pred  = {thr: 0.0 for thr in thresholds}
     g_gt    = {thr: 0.0 for thr in thresholds}
-
     for batch in loader:
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.use_amp):
             mask, logits, aux = forward_model(batch, model, args, device)
@@ -595,7 +563,6 @@ def evaluate_thresholds(
                 args.aux_w_d2,
                 grounding_loss_weight=getattr(args, "grounding_loss_weight", 0.0),
             ).item()
-
         probs = torch.sigmoid(logits).detach()
         for thr in thresholds:
             m = batch_metrics(logits, mask, threshold=thr)
@@ -608,28 +575,23 @@ def evaluate_thresholds(
             g_inter[thr] += (pred * mask).sum().item()
             g_pred[thr]  += pred.sum().item()
             g_gt[thr]    += mask.sum().item()
-
     n = max(len(loader), 1)
     for thr in thresholds:
         for key in ("loss", "iou", "dice", "pred_pos_ratio", "gt_pos_ratio"):
             results[thr][key] /= n
-        results[thr]["global_dice"] = (2 * g_inter[thr] + eps) / (g_pred[thr] + g_gt[thr] + eps)
-
-    sel_key = "global_dice" if use_global_dice else "dice"
+        results[thr]["micro_dice"] = (2 * g_inter[thr] + eps) / (g_pred[thr] + g_gt[thr] + eps)
+    sel_key = "micro_dice" if use_micro_dice else "dice"
     best_threshold = max(thresholds, key=lambda thr: results[thr][sel_key])
     return results, best_threshold
 
-
 def poly_lr(base_lr: float, epoch: int, max_epochs: int, power: float) -> float:
     return base_lr * ((1.0 - (epoch / max_epochs)) ** power)
-
 
 def cosine_lr(base_lr: float, epoch: int, max_epochs: int, min_lr: float) -> float:
     if max_epochs <= 1:
         return base_lr
     t = epoch / (max_epochs - 1)
     return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * t))
-
 
 def lr_with_warmup(
     base_lr: float,
@@ -672,17 +634,7 @@ def append_log_line(path: Path, line: str) -> None:
 
 
 def cleanup_dead_mps_graph_cache() -> int:
-    """Delete MPS graph-cache dirs from dead processes.
 
-    macOS Metal creates one directory per compiled graph under
-    .../T/com.apple.MetalPerformanceShadersGraph/mpsgraph-<PID>-*.
-    A killed/finished training process leaves hundreds of these behind.
-    Call this once per epoch to prevent the cache from filling the disk
-    over long (40-80 epoch) runs.  Returns the count of deleted dirs.
-    """
-    import glob
-    import os
-    import shutil
     current_pid = os.getpid()
     deleted = 0
     pattern = "/private/var/folders/*/*/T/com.apple.MetalPerformanceShadersGraph"
@@ -787,10 +739,8 @@ def apply_experiment_preset(args) -> None:
     args.bce_weight = 0.2
     args.dice_weight = 0.8
     args.tversky_weight = 0.0
-    # best.pt is saved when global (pooled) Dice improves; the loss itself
-    # still uses per-image Dice.
     args.use_pooled_dice = False
-    args.use_global_dice_selection = True
+    args.use_micro_dice_selection = True
     args.max_pos_weight = 16.0
     args.weight_decay = 1e-3
     args.early_stop_patience = 20
@@ -800,11 +750,6 @@ def apply_experiment_preset(args) -> None:
     args.encoder_type = "resnet50"
     args.pretrained_image_encoder = True
     args.freeze_encoder_bn = True
-    # Resolution 448 (divisible by 64 for the Haar DWT bottleneck: 448/64=7).
-    # Higher resolution gives small lesions more pixels, which directly helps
-    # the per-image Dice metric. ~2x activation memory vs 320; if the GPU
-    # OOMs, drop batch_size to 1 and raise grad_accum_steps to keep the
-    # effective batch size unchanged.
     args.image_size = 448
     args.batch_size = 1
     args.grad_accum_steps = 16
@@ -824,9 +769,6 @@ def apply_experiment_preset(args) -> None:
     args.elastic_alpha = 8.0
     args.elastic_sigma = 4.0
     args.prompt_dropout_prob = 0.3
-
-
-
 
 def main() -> None:
     parser = argparse.ArgumentParser("Train LFAENet-TGFS v2 on MosMed")
@@ -963,9 +905,9 @@ def main() -> None:
              "and threshold selection when --train-on-trainval is set. Default 0.1.",
     )
     parser.add_argument(
-        "--use-global-dice-selection", action=argparse.BooleanOptionalAction, default=False,
-        help="Use global (pooled) Dice for best-checkpoint selection instead of per-image Dice. "
-             "Per-image Dice is still logged every epoch for observation.",
+        "--use-micro-dice-selection", action=argparse.BooleanOptionalAction, default=False,
+        help="Use micro-averaged (pooled) Dice for best-checkpoint selection instead of the mean "
+             "per-image Dice. Per-image Dice is still logged every epoch for observation.",
     )
     parser.add_argument(
         "--use-pooled-dice", action=argparse.BooleanOptionalAction, default=False,
@@ -1126,7 +1068,6 @@ def main() -> None:
         encoder_params = [p for p in model.image_encoder.parameters() if p.requires_grad]
         enc_param_ids = {id(p) for p in encoder_params}
         other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in enc_param_ids]
-        # Encoder min_lr scales by the same ratio as base lr.
         ratio = encoder_lr / max(args.lr, 1e-12)
         encoder_min_lr = args.min_lr * ratio
         param_groups = [
@@ -1198,15 +1139,15 @@ def main() -> None:
         best_threshold = float(ckpt.get("best_threshold", best_threshold))
         if history_path.exists():
             history = json.loads(history_path.read_text(encoding="utf-8"))
-        cur_global_sel = bool(getattr(args, "use_global_dice_selection", False))
-        stored_global_sel = bool((ckpt.get("args") or {}).get("use_global_dice_selection", False))
-        if cur_global_sel != stored_global_sel and history:
-            sel_key = "val_global_dice" if cur_global_sel else "val_dice"
+        cur_micro_sel = bool(getattr(args, "use_micro_dice_selection", False))
+        stored_micro_sel = bool((ckpt.get("args") or {}).get("use_micro_dice_selection", False))
+        if cur_micro_sel != stored_micro_sel and history:
+            sel_key = "val_micro_dice" if cur_micro_sel else "val_dice"
             best_dice = max((float(e.get(sel_key, -1.0)) for e in history), default=-1.0)
             print(
                 f"  [resume] selection metric changed "
-                f"({'global' if stored_global_sel else 'per-image'} → "
-                f"{'global' if cur_global_sel else 'per-image'}); "
+                f"({'micro' if stored_micro_sel else 'per-image'} → "
+                f"{'micro' if cur_micro_sel else 'per-image'}); "
                 f"best_dice reset to {best_dice:.4f} (best {sel_key} in history)"
             )
 
@@ -1267,7 +1208,7 @@ def main() -> None:
             scaler=scaler,
             threshold=0.5,
         )
-        use_global_dice_sel = bool(getattr(args, "use_global_dice_selection", True))
+        use_micro_dice_sel = bool(getattr(args, "use_micro_dice_selection", True))
         val_threshold_results, epoch_best_threshold = evaluate_thresholds(
             model,
             val_loader,
@@ -1275,7 +1216,7 @@ def main() -> None:
             device,
             args,
             thresholds,
-            use_global_dice=use_global_dice_sel,
+            use_micro_dice=use_micro_dice_sel,
         )
         val_stats = val_threshold_results[epoch_best_threshold]
 
@@ -1290,7 +1231,7 @@ def main() -> None:
             "val_loss": val_stats["loss"],
             "val_iou": val_stats["iou"],
             "val_dice": val_stats["dice"],
-            "val_global_dice": val_stats["global_dice"],
+            "val_micro_dice": val_stats["micro_dice"],
             "val_pred_pos_ratio": val_stats["pred_pos_ratio"],
             "val_gt_pos_ratio": val_stats["gt_pos_ratio"],
             "val_threshold": epoch_best_threshold,
@@ -1302,7 +1243,7 @@ def main() -> None:
             f"train_loss={row['train_loss']:.6f} train_iou={row['train_iou']:.6f} train_dice={row['train_dice']:.6f} "
             f"train_pred_pos={row['train_pred_pos_ratio']:.6f} train_gt_pos={row['train_gt_pos_ratio']:.6f} "
             f"val_loss={row['val_loss']:.6f} val_iou={row['val_iou']:.6f} val_dice={row['val_dice']:.6f} "
-            f"val_global_dice={row['val_global_dice']:.6f} "
+            f"val_micro_dice={row['val_micro_dice']:.6f} "
             f"val_pred_pos={row['val_pred_pos_ratio']:.6f} val_gt_pos={row['val_gt_pos_ratio']:.6f} "
             f"val_thr={row['val_threshold']:.2f}"
         )
@@ -1321,7 +1262,7 @@ def main() -> None:
             save_dir / "last.pt",
         )
 
-        sel_metric = row["val_global_dice"] if use_global_dice_sel else row["val_dice"]
+        sel_metric = row["val_micro_dice"] if use_micro_dice_sel else row["val_dice"]
         if sel_metric > best_dice:
             best_dice = sel_metric
             best_threshold = epoch_best_threshold
@@ -1411,7 +1352,7 @@ def main() -> None:
         "loss": float(test_stats["loss"]),
         "iou": float(test_stats["iou"]),
         "dice": float(test_stats["dice"]),
-        "global_dice": float(test_stats["global_dice"]),
+        "micro_dice": float(test_stats["micro_dice"]),
         "pred_pos_ratio": float(test_stats["pred_pos_ratio"]),
         "gt_pos_ratio": float(test_stats["gt_pos_ratio"]),
     }
@@ -1420,7 +1361,7 @@ def main() -> None:
         (
             f"best_epoch={summary['best_epoch']} best_threshold={summary['best_threshold']:.2f} "
             f"test_loss={summary['loss']:.6f} test_iou={summary['iou']:.6f} test_dice={summary['dice']:.6f} "
-            f"test_global_dice={summary['global_dice']:.6f} "
+            f"test_micro_dice={summary['micro_dice']:.6f} "
             f"test_pred_pos={summary['pred_pos_ratio']:.6f} test_gt_pos={summary['gt_pos_ratio']:.6f}\n"
         ),
         encoding="utf-8",
