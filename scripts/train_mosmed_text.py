@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 from torch.optim import AdamW, SGD
-from torch.utils.data import ConcatDataset, DataLoader, Subset, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve()
@@ -752,8 +752,6 @@ def apply_experiment_preset(args) -> None:
     args.lr_warmup_epochs = 5
     args.max_grad_norm = 1.0
     args.optim_eps = 1e-6
-    args.train_on_trainval = False
-    args.use_benchmark_protocol = True
     args.ct_window = True
     args.elastic_prob = 0.3
     args.elastic_alpha = 8.0
@@ -885,36 +883,11 @@ def main() -> None:
     args.use_amp = device.type == "cuda"
 
     train_ds = build_dataset(args, "train")
-    val_ds = build_dataset(args, "val")
     test_ds = build_dataset(args, "test")
 
-    train_on_trainval = bool(getattr(args, "train_on_trainval", False))
-    use_benchmark_protocol = bool(getattr(args, "use_benchmark_protocol", False))
-    if use_benchmark_protocol:
-        val_aug_ds = build_dataset(args, "val", force_augment=True)
-        effective_train_ds = ConcatDataset([train_ds, val_aug_ds])
-        monitoring_ds = test_ds
-    elif train_on_trainval:
-        val_aug_ds = build_dataset(args, "val", force_augment=True)
-        train_clean_ds = build_dataset(args, "train", force_augment=False)
-        trainval_aug = ConcatDataset([train_ds, val_aug_ds])
-        trainval_clean = ConcatDataset([train_clean_ds, val_ds])
-        n_total = len(trainval_aug)
-        ratio = float(getattr(args, "internal_val_ratio", 0.1))
-        n_int_val = max(1, int(round(n_total * ratio)))
-        n_int_val = min(n_int_val, n_total - 1)
-        split_rng = random.Random(int(args.seed))
-        shuffled = list(range(n_total))
-        split_rng.shuffle(shuffled)
-        int_val_idx = sorted(shuffled[:n_int_val])
-        train_idx = sorted(shuffled[n_int_val:])
-        effective_train_ds = Subset(trainval_aug, train_idx)
-        monitoring_ds = Subset(trainval_clean, int_val_idx)
-        args.internal_val_indices = int_val_idx
-        args.internal_val_size = n_int_val
-    else:
-        effective_train_ds = train_ds
-        monitoring_ds = val_ds
+    val_aug_ds = build_dataset(args, "val", force_augment=True)
+    effective_train_ds = ConcatDataset([train_ds, val_aug_ds])
+    monitoring_ds = test_ds
 
     train_mask_stats = compute_foreground_stats(
         args.dataset_format,
@@ -937,22 +910,7 @@ def main() -> None:
         max_length=args.max_text_len,
         prompt_mode=args.prompt_mode,
     )
-    if train_on_trainval and getattr(args, "balanced_sampling", False):
-        if hasattr(train_ds, "get_class_labels") and hasattr(val_aug_ds, "get_class_labels"):
-            all_labels = train_ds.get_class_labels() + val_aug_ds.get_class_labels()
-            subset_labels = [all_labels[i] for i in train_idx]
-            counts: dict[int, int] = {}
-            for lbl in subset_labels:
-                counts[lbl] = counts.get(lbl, 0) + 1
-            if len(counts) >= 2:
-                weights = [1.0 / counts[lbl] for lbl in subset_labels]
-                train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-            else:
-                train_sampler = None
-        else:
-            train_sampler = None
-    else:
-        train_sampler = build_balanced_sampler(effective_train_ds) if getattr(args, "balanced_sampling", False) else None
+    train_sampler = build_balanced_sampler(effective_train_ds) if getattr(args, "balanced_sampling", False) else None
 
     train_loader = DataLoader(
         effective_train_ds,
@@ -1084,12 +1042,7 @@ def main() -> None:
         txt_log_path,
         (
             f"train_samples={len(effective_train_ds)}"
-            + (
-                f" (trainval split: train={len(train_ds)}+val={len(val_aug_ds)} -> "
-                f"internal_val={len(monitoring_ds)} effective_train={len(effective_train_ds)})"
-                if train_on_trainval else ""
-            )
-            + f" monitoring_samples={len(monitoring_ds)} test_samples={len(test_ds)}"
+            f" monitoring_samples={len(monitoring_ds)} test_samples={len(test_ds)}"
         ),
     )
     append_log_line(
