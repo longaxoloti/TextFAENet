@@ -388,7 +388,8 @@ def forward_model(batch, model, args, device: torch.device):
     return mask, logits, aux
 
 def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=None, threshold: float = 0.5):
-    # from tqdm import tqdm
+    from tqdm import tqdm
+
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
     total_loss = 0.0
