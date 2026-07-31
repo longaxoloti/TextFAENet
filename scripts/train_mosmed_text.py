@@ -765,393 +765,67 @@ def checkpoint_state_dict(model: nn.Module, args) -> dict[str, torch.Tensor]:
 
 
 def apply_experiment_preset(args) -> None:
-    if args.experiment == "cxr_bert_v6":
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.low_level_hf_scale = 0.6
-        args.learnable_low_level_hf_scale = True
-        args.spatial_sharpen_power = 2.0
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.2
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.1
-        args.boundary_weight = 0.05
-        args.bce_weight = 0.2
-        args.dice_weight = 0.8
-        args.max_pos_weight = 16.0
-        args.weight_decay = 1e-3
-        args.early_stop_patience = 20
-        args.balanced_sampling = False
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        args.image_size = 320
-        args.batch_size = 2
-        args.grad_accum_steps = 8
-        args.aux_w_d4 = 0.2
-        args.aux_w_d3 = 0.3
-        args.aux_w_d2 = 0.4
-        # Stability recipe.
-        args.lr = 5e-5
-        args.encoder_lr = 5e-6
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 5
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-    elif args.experiment == "cxr_bert_v7a":
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.learnable_low_level_hf_scale = True
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.1
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.3
-        args.boundary_weight = 0.1
-        args.bce_weight = 0.2
-        args.dice_weight = 0.8
-        args.max_pos_weight = 16.0
-        args.weight_decay = 5e-4
-        args.early_stop_patience = 20
-        args.balanced_sampling = True
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        args.image_size = 320
-        args.batch_size = 2
-        args.grad_accum_steps = 4
-        args.lr = 1e-4
-        args.encoder_lr = 1e-5
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 10
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-        args.train_on_trainval = True
-    elif args.experiment == "cxr_bert_v8":
-        # Small-lesion recall recipe. Identical architecture + the same tuned
-        # stability/regularisation recipe as the mosmed_v6.1 run, with ONE change:
-        # the region loss is Focal-Tversky (beta>alpha) instead of plain Dice, to
-        # raise recall on the tiny/scattered COVID lesions that cap per-image Dice.
-        # Kept as a clean A/B against v6.1 (everything else equal).
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.low_level_hf_scale = 0.6
-        args.learnable_low_level_hf_scale = True
-        args.spatial_sharpen_power = 2.0
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.2
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.1
-        # Loss: Focal-Tversky as the main region term (no plain Dice).
-        args.bce_weight = 0.2
-        args.dice_weight = 0.0
-        args.tversky_weight = 0.8
-        args.tversky_alpha = 0.3
-        args.tversky_beta = 0.7
-        args.focal_gamma = 1.3333
-        args.boundary_weight = 0.05
-        args.aux_w_d4 = 0.2
-        args.aux_w_d3 = 0.3
-        args.aux_w_d2 = 0.4
-        args.max_pos_weight = 16.0
-        args.weight_decay = 1e-3
-        args.early_stop_patience = 20
-        args.balanced_sampling = False
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        args.image_size = 320
-        args.batch_size = 2
-        args.grad_accum_steps = 8
-        args.lr = 5e-5
-        args.encoder_lr = 5e-6
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 5
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-        args.train_on_trainval = False
-    elif args.experiment == "cxr_bert_v9":
-        # Semantic-alignment + CT-aware data recipe. Same architecture as v6.1,
-        # but the three knobs that matter most for the per-image-Dice ceiling
-        # are turned on together: (a) the text encoder is partially adaptable
-        # (last 2 CXR-BERT layers unfrozen) so prompts can specialise to MosMed,
-        # (b) grounding + boundary losses are weighted up so the model is
-        # actually forced to align the text-attention map with the lesion mask
-        # (fixes the "presence-only" red flag from the M0..M8 matrix), and
-        # (c) the data layer adds per-image histogram windowing, elastic
-        # deformation, and prompt-clause dropout so visual contrast and text
-        # diversity are no longer the bottleneck.
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.unfreeze_last_n = 2
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.low_level_hf_scale = 0.6
-        args.learnable_low_level_hf_scale = True
-        args.spatial_sharpen_power = 2.0
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.2
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.5
-        args.boundary_weight = 0.15
-        args.bce_weight = 0.2
-        args.dice_weight = 0.8
-        args.tversky_weight = 0.0
-        args.max_pos_weight = 16.0
-        args.weight_decay = 1e-3
-        args.early_stop_patience = 20
-        args.balanced_sampling = False
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        args.image_size = 320
-        args.batch_size = 2
-        args.grad_accum_steps = 8
-        args.aux_w_d4 = 0.2
-        args.aux_w_d3 = 0.3
-        args.aux_w_d2 = 0.4
-        # Lower LR for the now-trainable BERT layers; encoder/decoder unchanged.
-        args.lr = 5e-5
-        args.encoder_lr = 5e-6
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 5
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-        # Resplit (train+val) → 90% effective_train + 10% internal_val for
-        # monitoring/threshold tuning, mirroring the train_brain_tumors v6 recipe.
-        # The test set (273 slices) stays untouched, so test_dice is still a
-        # fair apples-to-apples comparison with v6.1 / v8.
-        args.train_on_trainval = True
-        args.internal_val_ratio = 0.1
-        # Data-layer additions.
-        args.ct_window = True
-        args.elastic_prob = 0.3
-        args.elastic_alpha = 8.0
-        args.elastic_sigma = 4.0
-        args.prompt_dropout_prob = 0.3
-    elif args.experiment == "cxr_bert_v9b":
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.unfreeze_last_n = 2
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.low_level_hf_scale = 0.6
-        args.learnable_low_level_hf_scale = True
-        args.spatial_sharpen_power = 2.0
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.2
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.3
-        args.boundary_weight = 0.15
-        args.bce_weight = 0.2
-        args.dice_weight = 0.8
-        args.tversky_weight = 0.0
-        args.max_pos_weight = 16.0
-        args.weight_decay = 1e-3
-        args.early_stop_patience = 20
-        args.balanced_sampling = False
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        args.image_size = 320
-        args.batch_size = 2
-        args.grad_accum_steps = 8
-        args.aux_w_d4 = 0.2
-        args.aux_w_d3 = 0.3
-        args.aux_w_d2 = 0.4
-        args.lr = 5e-5
-        args.encoder_lr = 5e-6
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 5
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-        args.train_on_trainval = False
-        args.ct_window = True
-        args.elastic_prob = 0.3
-        args.elastic_alpha = 8.0
-        args.elastic_sigma = 4.0
-        args.prompt_dropout_prob = 0.3
-    elif args.experiment == "cxr_bert_v9e":
-        # v9e = v9b architecture with train+val / validate-on-test data protocol.
-        #   * LOSS: per-image Dice (use_pooled_dice=False, apples-to-apples with v9b)
-        #   * SELECTION: global (pooled) Dice (use_global_dice_selection=True).
-        #     Global Dice matches what FMISeg/LViT SOTA reports and is less noisy
-        #     on the heavily class-imbalanced MosMed test set. Per-image Dice is
-        #     still logged each epoch for observation.
-        #   * use_benchmark_protocol=True: benchmark evaluation protocol.
-        # Architecture, losses, augmentation, LR schedule are identical to v9b.
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.unfreeze_last_n = 2
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.low_level_hf_scale = 0.6
-        args.learnable_low_level_hf_scale = True
-        args.spatial_sharpen_power = 2.0
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.2
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.3
-        args.boundary_weight = 0.15
-        args.bce_weight = 0.2
-        args.dice_weight = 0.8
-        args.tversky_weight = 0.0
-        # Global Dice selection: best.pt is saved when global (pooled) Dice improves.
-        # Per-image Dice is still logged each epoch for observation.
-        # Loss still uses per-image Dice (use_pooled_dice=False).
-        args.use_pooled_dice = False
-        args.use_global_dice_selection = True
-        args.max_pos_weight = 16.0
-        args.weight_decay = 1e-3
-        args.early_stop_patience = 20
-        args.balanced_sampling = False
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        # Resolution 448 (divisible by 64 for the Haar DWT bottleneck: 448/64=7).
-        # Higher res gives tiny COVID lesions more pixels, which directly helps the
-        # per-image Dice metric that this preset selects on. ~2x activation memory
-        # vs 320; if MPS OOMs, drop batch_size to 1 and raise grad_accum_steps to 16
-        # to keep the effective batch at 16.
-        args.image_size = 448
-        args.batch_size = 1
-        args.grad_accum_steps = 16
-        args.aux_w_d4 = 0.2
-        args.aux_w_d3 = 0.3
-        args.aux_w_d2 = 0.4
-        args.lr = 5e-5
-        args.encoder_lr = 5e-6
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 5
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-        args.train_on_trainval = False
-        args.use_benchmark_protocol = True
-        args.ct_window = True
-        args.elastic_prob = 0.3
-        args.elastic_alpha = 8.0
-        args.elastic_sigma = 4.0
-        args.prompt_dropout_prob = 0.3
-    elif args.experiment in ("cxr_bert_v9c", "cxr_bert_v9d"):
-        # v9c: global-Dice-aligned training. Three axes changed vs v9b:
-        # (1) dice_loss is now batch-pooled (not per-image-mean) — loss directly
-        #     optimises the same pixel-pooled Dice that FMISeg/LViT report.
-        # (2) pos_weight 16 -> 8 — the high pos_weight in v9b was a per-image-Dice
-        #     hack (pushes recall on tiny slices); it adds FP that hurts global
-        #     precision on large lesions, which drive global Dice.
-        # (3) Training and model-selection at 384x384 (must be div-by-64 for the
-        #     Haar DWT bottleneck; 384/64=6). Multi-scale TTA experiments showed
-        #     global Dice rises monotonically with scale up to 512 on v9b best.pt,
-        #     confirming higher resolution directly helps global Dice.
-        # Everything else is kept from v9b (unfreeze_last_n=2, ct_window, elastic
-        # at reduced prob, prompt_dropout, grounding=0.3).
-        args.use_cxr_bert = True
-        args.freeze_text_backbone = True
-        args.unfreeze_last_n = 2
-        args.fusion_mode = "both"
-        args.encoder_text_fusion = "cross_attn"
-        args.hh_drop_mode = "learned"
-        args.low_level_hf_scale = 0.6
-        args.learnable_low_level_hf_scale = True
-        args.spatial_sharpen_power = 2.0
-        args.learnable_spatial_sharpen = True
-        args.use_deep_supervision = True
-        args.augment_train = True
-        args.norm_type = "gn"
-        args.conv_block_depth = 3
-        args.dropout_p = 0.2
-        args.grounding_n_heads = 4
-        args.grounding_loss_weight = 0.3
-        args.boundary_weight = 0.15
-        args.bce_weight = 0.2
-        args.dice_weight = 0.8
-        args.tversky_weight = 0.0
-        # pooled dice loss + reduced pos_weight for global-Dice alignment
-        args.use_pooled_dice = True
-        args.max_pos_weight = 8.0
-        args.use_global_dice_selection = True
-        args.weight_decay = 1e-3
-        args.early_stop_patience = 20
-        args.balanced_sampling = False
-        args.use_tta = True
-        args.epochs = 80
-        args.encoder_type = "resnet50"
-        args.pretrained_image_encoder = True
-        args.freeze_encoder_bn = True
-        # 384 is divisible by 64 (Haar DWT bottleneck requirement)
-        args.image_size = 384
-        args.batch_size = 2
-        args.grad_accum_steps = 8
-        args.aux_w_d4 = 0.2
-        args.aux_w_d3 = 0.3
-        args.aux_w_d2 = 0.4
-        args.lr = 5e-5
-        args.encoder_lr = 5e-6
-        args.min_lr = 1e-5
-        args.lr_warmup_epochs = 5
-        args.max_grad_norm = 1.0
-        args.optim_eps = 1e-6
-        args.train_on_trainval = False
-        args.ct_window = True
-        args.elastic_prob = 0.15
-        args.elastic_alpha = 8.0
-        args.elastic_sigma = 4.0
-        args.prompt_dropout_prob = 0.3
-        args.metric_thresholds = "0.35,0.40,0.45,0.50,0.55,0.60"
-        if args.experiment == "cxr_bert_v9d":
-            # v9d = v9c with the ResNet-50 backbone initialised from RadImageNet
-            # (medical CT/MRI/US pretraining) instead of ImageNet. Everything else
-            # is identical to v9c so the two are a clean backbone ablation. The
-            # ImageNet path (v9c and all other presets) is untouched as a fallback.
-            args.image_backbone_weights = "radimagenet"
-            args.radimagenet_ckpt = str(TEXTFAENET_ROOT / "weights" / "radimagenet" / "ResNet50.pt")
+    # Fixed training configuration for LFAENet-TGFS v2 on MosMedData+.
+    args.use_cxr_bert = True
+    args.freeze_text_backbone = True
+    args.unfreeze_last_n = 2
+    args.fusion_mode = "both"
+    args.encoder_text_fusion = "cross_attn"
+    args.hh_drop_mode = "learned"
+    args.low_level_hf_scale = 0.6
+    args.learnable_low_level_hf_scale = True
+    args.spatial_sharpen_power = 2.0
+    args.learnable_spatial_sharpen = True
+    args.use_deep_supervision = True
+    args.augment_train = True
+    args.norm_type = "gn"
+    args.conv_block_depth = 3
+    args.dropout_p = 0.2
+    args.grounding_n_heads = 4
+    args.grounding_loss_weight = 0.3
+    args.boundary_weight = 0.15
+    args.bce_weight = 0.2
+    args.dice_weight = 0.8
+    args.tversky_weight = 0.0
+    # best.pt is saved when global (pooled) Dice improves; the loss itself
+    # still uses per-image Dice.
+    args.use_pooled_dice = False
+    args.use_global_dice_selection = True
+    args.max_pos_weight = 16.0
+    args.weight_decay = 1e-3
+    args.early_stop_patience = 20
+    args.balanced_sampling = False
+    args.use_tta = True
+    args.epochs = 80
+    args.encoder_type = "resnet50"
+    args.pretrained_image_encoder = True
+    args.freeze_encoder_bn = True
+    # Resolution 448 (divisible by 64 for the Haar DWT bottleneck: 448/64=7).
+    # Higher resolution gives small lesions more pixels, which directly helps
+    # the per-image Dice metric. ~2x activation memory vs 320; if the GPU
+    # OOMs, drop batch_size to 1 and raise grad_accum_steps to keep the
+    # effective batch size unchanged.
+    args.image_size = 448
+    args.batch_size = 1
+    args.grad_accum_steps = 16
+    args.aux_w_d4 = 0.2
+    args.aux_w_d3 = 0.3
+    args.aux_w_d2 = 0.4
+    args.lr = 5e-5
+    args.encoder_lr = 5e-6
+    args.min_lr = 1e-5
+    args.lr_warmup_epochs = 5
+    args.max_grad_norm = 1.0
+    args.optim_eps = 1e-6
+    args.train_on_trainval = False
+    args.use_benchmark_protocol = True
+    args.ct_window = True
+    args.elastic_prob = 0.3
+    args.elastic_alpha = 8.0
+    args.elastic_sigma = 4.0
+    args.prompt_dropout_prob = 0.3
+
+
 
 
 def main() -> None:
@@ -1165,7 +839,6 @@ def main() -> None:
         default="text_csv",
     )
     parser.add_argument("--save-dir", type=str, default=str(TEXTFAENET_ROOT / "runs" / "mosmed_text_faenet"))
-    parser.add_argument("--experiment", type=str, choices=["cxr_bert_v6", "cxr_bert_v7a", "cxr_bert_v8", "cxr_bert_v9", "cxr_bert_v9b", "cxr_bert_v9c", "cxr_bert_v9d", "cxr_bert_v9e"], default="cxr_bert_v6")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=2)
