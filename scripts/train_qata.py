@@ -549,11 +549,6 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--metric-thresholds", type=str, default="0.35,0.40,0.45,0.50,0.55")
     parser.add_argument(
-        "--use-test-as-val",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument(
         "--no-text",
         action="store_true",
         default=False,
@@ -640,22 +635,20 @@ def main() -> None:
         max_samples=args.max_test_samples,
     )
 
-    if args.use_test_as_val:
-        train_ds = train_full_ds
-        val_ds = test_ds
-    else:
-        total = len(train_full_ds)
-        val_count = max(1, int(total * args.val_ratio))
-        if val_count >= total:
-            val_count = total - 1
+    # Validation is always a seeded held-out slice of train; test is never used for
+    # model selection, threshold search, or early stopping.
+    total = len(train_full_ds)
+    val_count = max(1, int(total * args.val_ratio))
+    if val_count >= total:
+        val_count = total - 1
 
-        rng = random.Random(args.seed)
-        indices = list(range(total))
-        rng.shuffle(indices)
-        val_idx = indices[:val_count]
-        train_idx = indices[val_count:]
-        train_ds = Subset(train_full_ds, train_idx)
-        val_ds = Subset(train_full_ds, val_idx)
+    rng = random.Random(args.seed)
+    indices = list(range(total))
+    rng.shuffle(indices)
+    val_idx = indices[:val_count]
+    train_idx = indices[val_count:]
+    train_ds = Subset(train_full_ds, train_idx)
+    val_ds = Subset(train_full_ds, val_idx)
 
     collate_fn = TextSegCollator(
         tokenizer=tokenizer if args.model_type != "faenet" else None,
