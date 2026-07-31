@@ -6,7 +6,7 @@ is rebuilt EXACTLY as it was trained.
 Loads best.pt + config.json from a runs/<exp> directory. Computes h-flip TTA
 (original + flip/swap-text averaged); optionally adds extra scales via --scales
 for multi-scale TTA. Caches probabilities once, then sweeps thresholds cheaply.
-Reports BOTH global Dice (primary metric) and per-image Dice (reference).
+Reports Dice and IoU on the selected split.
 
 Examples:
     # Test set, checkpoint's best threshold, base scale only (h-flip TTA)
@@ -240,21 +240,18 @@ def main() -> None:
         gt_sum = all_gts_t.sum(dim=(1, 2, 3))
         union = ((pred + all_gts_t) > 0).float().sum(dim=(1, 2, 3))
         results[t] = {
-            "global_dice": (2 * inter.sum().item() + eps) / (pred_sum.sum().item() + gt_sum.sum().item() + eps),
-            "global_iou": (inter.sum().item() + eps) / (union.sum().item() + eps),
-            "per_img_dice": ((2 * inter + eps) / (pred_sum + gt_sum + eps)).mean().item(),
-            "per_img_iou": ((inter + eps) / (union + eps)).mean().item(),
+            "dice": (2 * inter.sum().item() + eps) / (pred_sum.sum().item() + gt_sum.sum().item() + eps),
+            "iou": (inter.sum().item() + eps) / (union.sum().item() + eps),
         }
 
     if cli_args.sweep:
-        print(f"\n{'thr':>5} | {'global Dice':>11} {'global IoU':>10} | {'per-img Dice':>12} {'per-img IoU':>11}")
-        print("-" * 64)
+        print(f"\n{'thr':>5} | {'Dice':>8} {'IoU':>8}")
+        print("-" * 28)
         for t in thresholds_to_sweep:
             r = results[t]
-            print(f"{t:>5.2f} | {r['global_dice']:>11.4f} {r['global_iou']:>10.4f} | "
-                  f"{r['per_img_dice']:>12.4f} {r['per_img_iou']:>11.4f}")
-        best_t = max(thresholds_to_sweep, key=lambda t: results[t]["global_dice"])
-        print(f"\nbest (global Dice): thr={best_t:.2f}  global_dice={results[best_t]['global_dice']:.4f}")
+            print(f"{t:>5.2f} | {r['dice']:>8.4f} {r['iou']:>8.4f}")
+        best_t = max(thresholds_to_sweep, key=lambda t: results[t]["dice"])
+        print(f"\nbest: thr={best_t:.2f}  dice={results[best_t]['dice']:.4f}")
 
     r = results[applied_threshold]
     summary = {
@@ -264,10 +261,8 @@ def main() -> None:
         "ckpt_threshold": ckpt_threshold,
         "applied_threshold": applied_threshold,
         "scales": scales,
-        "global_dice": float(r["global_dice"]),
-        "global_iou": float(r["global_iou"]),
-        "per_img_dice": float(r["per_img_dice"]),
-        "per_img_iou": float(r["per_img_iou"]),
+        "dice": float(r["dice"]),
+        "iou": float(r["iou"]),
     }
     out_name = cli_args.output_json or f"eval_{cli_args.split}_thr{int(round(applied_threshold * 100)):02d}.json"
     output_path = run_dir / out_name

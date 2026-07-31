@@ -394,7 +394,6 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
     model.train() if train_mode else model.eval()
     total_loss = 0.0
     total_iou = 0.0
-    total_dice = 0.0
     total_pred_pos_ratio = 0.0
     total_gt_pos_ratio = 0.0
     g_inter = 0.0
@@ -450,7 +449,6 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
         m = batch_metrics(logits.detach(), mask, threshold=threshold)
         total_loss += loss.item()
         total_iou += m["iou"]
-        total_dice += m["dice"]
         total_pred_pos_ratio += m["pred_pos_ratio"]
         total_gt_pos_ratio += m["gt_pos_ratio"]
         pred = (torch.sigmoid(logits.detach()) > threshold).float()
@@ -463,17 +461,16 @@ def run_epoch(model, loader, criterion, device, args, optimizer=None, scaler=Non
     return {
         "loss": total_loss / n,
         "iou": total_iou / n,
-        "dice": total_dice / n,
+        "dice": (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps),
         "pred_pos_ratio": total_pred_pos_ratio / n,
         "gt_pos_ratio": total_gt_pos_ratio / n,
-        "micro_dice": (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps),
     }
 
 
 @torch.no_grad()
 def run_test_with_tta(model, loader, criterion, device, args, tokenizer, threshold: float):
     model.eval()
-    total = {"loss": 0.0, "iou": 0.0, "dice": 0.0, "pred_pos_ratio": 0.0, "gt_pos_ratio": 0.0}
+    total = {"loss": 0.0, "iou": 0.0, "pred_pos_ratio": 0.0, "gt_pos_ratio": 0.0}
     n_batches = 0
     g_inter = 0.0
     g_pred_sum = 0.0
@@ -520,7 +517,6 @@ def run_test_with_tta(model, loader, criterion, device, args, tokenizer, thresho
         m = batch_metrics(avg_logits, mask, threshold=threshold)
         total["loss"] += loss
         total["iou"] += m["iou"]
-        total["dice"] += m["dice"]
         total["pred_pos_ratio"] += m["pred_pos_ratio"]
         total["gt_pos_ratio"] += m["gt_pos_ratio"]
         pred = (avg_probs > threshold).float()
@@ -532,19 +528,18 @@ def run_test_with_tta(model, loader, criterion, device, args, tokenizer, thresho
     n = max(n_batches, 1)
     eps = 1e-6
     result = {k: v / n for k, v in total.items()}
-    result["micro_dice"] = (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps)
+    result["dice"] = (2 * g_inter + eps) / (g_pred_sum + g_gt_sum + eps)
     return result
 
 
 @torch.no_grad()
 def evaluate_thresholds(
     model, loader, criterion, device, args, thresholds: list[float],
-    use_micro_dice: bool = False,
 ) -> tuple[dict[float, dict[str, float]], float]:
     model.eval()
     eps = 1e-6
     results: dict[float, dict[str, float]] = {
-        thr: {"loss": 0.0, "iou": 0.0, "dice": 0.0, "micro_dice": 0.0,
+        thr: {"loss": 0.0, "iou": 0.0,
               "pred_pos_ratio": 0.0, "gt_pos_ratio": 0.0}
         for thr in thresholds
     }
@@ -569,7 +564,6 @@ def evaluate_thresholds(
             m = batch_metrics(logits, mask, threshold=thr)
             results[thr]["loss"] += loss
             results[thr]["iou"] += m["iou"]
-            results[thr]["dice"] += m["dice"]
             results[thr]["pred_pos_ratio"] += m["pred_pos_ratio"]
             results[thr]["gt_pos_ratio"] += m["gt_pos_ratio"]
             pred = (probs > thr).float()
@@ -578,11 +572,10 @@ def evaluate_thresholds(
             g_gt[thr]    += mask.sum().item()
     n = max(len(loader), 1)
     for thr in thresholds:
-        for key in ("loss", "iou", "dice", "pred_pos_ratio", "gt_pos_ratio"):
+        for key in ("loss", "iou", "pred_pos_ratio", "gt_pos_ratio"):
             results[thr][key] /= n
-        results[thr]["micro_dice"] = (2 * g_inter[thr] + eps) / (g_pred[thr] + g_gt[thr] + eps)
-    sel_key = "micro_dice" if use_micro_dice else "dice"
-    best_threshold = max(thresholds, key=lambda thr: results[thr][sel_key])
+        results[thr]["dice"] = (2 * g_inter[thr] + eps) / (g_pred[thr] + g_gt[thr] + eps)
+    best_threshold = max(thresholds, key=lambda thr: results[thr]["dice"])
     return results, best_threshold
 
 def poly_lr(base_lr: float, epoch: int, max_epochs: int, power: float) -> float:
@@ -709,16 +702,13 @@ def build_dataset(args, split: str, force_augment: bool | None = None):
         max_samples=max_samples,
     )
 
-
 def checkpoint_state_dict(model: nn.Module, args) -> dict[str, torch.Tensor]:
     state = model.state_dict()
     if args.use_cxr_bert and args.freeze_text_backbone:
         state = {k: v for k, v in state.items() if not k.startswith("text_encoder.model.")}
     return state
 
-
 def apply_experiment_preset(args) -> None:
-    # Fixed training configuration for LFAENet-TGFS v2 on MosMedData+.
     args.use_cxr_bert = True
     args.freeze_text_backbone = True
     args.unfreeze_last_n = 2
@@ -741,7 +731,6 @@ def apply_experiment_preset(args) -> None:
     args.dice_weight = 0.8
     args.tversky_weight = 0.0
     args.use_pooled_dice = False
-    args.use_micro_dice_selection = True
     args.max_pos_weight = 16.0
     args.weight_decay = 1e-3
     args.early_stop_patience = 20
@@ -775,12 +764,7 @@ def main() -> None:
     parser = argparse.ArgumentParser("Train LFAENet-TGFS v2 on MosMed")
     parser.add_argument("--model-type", type=str, choices=["lfaenet_tgfs_v2", "faenet"], default="lfaenet_tgfs_v2")
     parser.add_argument("--data-root", type=str, default=str(TEXTFAENET_ROOT.parent / "dataset" / "COVID_CT_MosMed"))
-    parser.add_argument(
-        "--dataset-format",
-        type=str,
-        choices=["prepared", "text_csv", "prompt_folder"],
-        default="text_csv",
-    )
+    parser.add_argument("--dataset-format", type=str, choices=["prepared", "text_csv", "prompt_folder"], default="text_csv")
     parser.add_argument("--save-dir", type=str, default=str(TEXTFAENET_ROOT / "runs" / "mosmed_text_faenet"))
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -807,8 +791,6 @@ def main() -> None:
     parser.add_argument("--tversky-beta", type=float, default=0.7,
                         help="Tversky false-negative weight (>alpha favours recall on small lesions).")
     parser.add_argument("--focal-gamma", type=float, default=1.3333, help="Focal-Tversky focusing exponent.")
-    # MosMed-specific data-layer knobs (used by MosMedTextCSVDataset; default
-    # off so the existing v6/v7a/v8 presets keep their prior behaviour).
     parser.add_argument("--ct-window", action=argparse.BooleanOptionalAction, default=False,
                         help="Per-image 1-99 percentile histogram clip — pseudo lung windowing.")
     parser.add_argument("--elastic-prob", type=float, default=0.0,
@@ -835,7 +817,6 @@ def main() -> None:
              "Must be divisible by 64 (Haar DWT bottleneck). E.g. 320, 384, 448, 512.",
     )
     parser.add_argument("--early-stop-patience", type=int, default=8)
-
     parser.add_argument("--use-cxr-bert", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cxr-bert-dir", type=str, default=str(TEXTFAENET_ROOT / "BiomedVLP-CXR-BERT-specialized"))
     parser.add_argument("--freeze-text-backbone", action=argparse.BooleanOptionalAction, default=True)
@@ -855,21 +836,10 @@ def main() -> None:
     parser.add_argument("--learnable-low-level-hf-scale", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--spatial-sharpen-power", type=float, default=2.0)
     parser.add_argument("--learnable-spatial-sharpen", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument(
-        "--encoder-text-fusion",
-        type=str,
-        choices=["film", "cross_attn"],
-        default="film",
-        help="Encoder text fusion type. 'film'=TextFiLM2D (default), 'cross_attn'=SpatialTextFusion (v6 preset sets this).",
-    )
+    parser.add_argument("--encoder-text-fusion", type=str, choices=["film", "cross_attn"], default="film", help="Encoder text fusion type. 'film'=TextFiLM2D (default), 'cross_attn'=SpatialTextFusion (v6 preset sets this).")
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--save-debug-vis", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument(
-        "--prompt-mode",
-        type=str,
-        choices=["native", "canonical", "generic", "lesion", "empty", "shuffle"],
-        default="native",
-    )
+    parser.add_argument("--prompt-mode", type=str, choices=["native", "canonical", "generic", "lesion", "empty", "shuffle"], default="native")
     parser.add_argument("--augment-train", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--norm-type", type=str, choices=["bn", "gn"], default="bn")
     parser.add_argument("--conv-block-depth", type=int, choices=[2, 3], default=2)
@@ -882,42 +852,9 @@ def main() -> None:
     parser.add_argument("--encoder-type", type=str, choices=["from_scratch", "resnet50"], default="from_scratch")
     parser.add_argument("--pretrained-image-encoder", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze-encoder-bn", action=argparse.BooleanOptionalAction, default=True)
-    # Stability knobs for fine-tuning pretrained encoders.
-    parser.add_argument(
-        "--encoder-lr", type=float, default=0.0,
-        help="If >0 and encoder_type=resnet50, use a separate lr for the image_encoder param group.",
-    )
-    parser.add_argument(
-        "--max-grad-norm", type=float, default=0.0,
-        help="If >0, clip global grad norm to this value before each optimizer step.",
-    )
-    parser.add_argument(
-        "--optim-eps", type=float, default=1e-8,
-        help="AdamW eps (set 1e-6 for better numerical stability on MPS / mixed precision).",
-    )
-    parser.add_argument(
-        "--train-on-trainval", action=argparse.BooleanOptionalAction, default=False,
-        help="Combine train+val for training. A stratified-by-seed holdout from "
-             "(train+val) is used for monitoring/threshold tuning. Test set is not touched.",
-    )
-    parser.add_argument(
-        "--internal-val-ratio", type=float, default=0.1,
-        help="Fraction of (train+val) held out as internal_val for monitoring "
-             "and threshold selection when --train-on-trainval is set. Default 0.1.",
-    )
-    parser.add_argument(
-        "--use-micro-dice-selection", action=argparse.BooleanOptionalAction, default=False,
-        help="Use micro-averaged (pooled) Dice for best-checkpoint selection instead of the mean "
-             "per-image Dice. Per-image Dice is still logged every epoch for observation.",
-    )
-    parser.add_argument(
-        "--use-pooled-dice", action=argparse.BooleanOptionalAction, default=False,
-        help="Use batch-pooled Dice in the loss function instead of per-image-mean Dice.",
-    )
-    parser.add_argument(
-        "--use-benchmark-protocol", action=argparse.BooleanOptionalAction, default=False,
-        help="Use standard benchmark evaluation protocol.",
-    )
+    parser.add_argument("--encoder-lr", type=float, default=0.0, help="If >0 and encoder_type=resnet50, use a separate lr for the image_encoder param group.")
+    parser.add_argument("--max-grad-norm", type=float, default=0.0, help="If >0, clip global grad norm to this value before each optimizer step.")
+    parser.add_argument("--optim-eps", type=float, default=1e-8,help="AdamW eps (set 1e-6 for better numerical stability on MPS / mixed precision).")
     args = parser.parse_args()
     _cli_epochs = args.epochs
     _cli_early_stop = args.early_stop_patience
@@ -931,7 +868,6 @@ def main() -> None:
             f"--override-image-size must be divisible by 64 (got {args.override_image_size})"
         )
         args.image_size = int(args.override_image_size)
-
     if args.drop_hh_in_decoder is not None:
         args.hh_drop_mode = "zero" if args.drop_hh_in_decoder else "keep"
     if args.unfreeze_last_n < 0:
@@ -1140,17 +1076,6 @@ def main() -> None:
         best_threshold = float(ckpt.get("best_threshold", best_threshold))
         if history_path.exists():
             history = json.loads(history_path.read_text(encoding="utf-8"))
-        cur_micro_sel = bool(getattr(args, "use_micro_dice_selection", False))
-        stored_micro_sel = bool((ckpt.get("args") or {}).get("use_micro_dice_selection", False))
-        if cur_micro_sel != stored_micro_sel and history:
-            sel_key = "val_micro_dice" if cur_micro_sel else "val_dice"
-            best_dice = max((float(e.get(sel_key, -1.0)) for e in history), default=-1.0)
-            print(
-                f"  [resume] selection metric changed "
-                f"({'micro' if stored_micro_sel else 'per-image'} → "
-                f"{'micro' if cur_micro_sel else 'per-image'}); "
-                f"best_dice reset to {best_dice:.4f} (best {sel_key} in history)"
-            )
 
     (save_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     append_log_line(txt_log_path, f"save_dir={save_dir}")
@@ -1209,7 +1134,6 @@ def main() -> None:
             scaler=scaler,
             threshold=0.5,
         )
-        use_micro_dice_sel = bool(getattr(args, "use_micro_dice_selection", True))
         val_threshold_results, epoch_best_threshold = evaluate_thresholds(
             model,
             val_loader,
@@ -1217,7 +1141,6 @@ def main() -> None:
             device,
             args,
             thresholds,
-            use_micro_dice=use_micro_dice_sel,
         )
         val_stats = val_threshold_results[epoch_best_threshold]
 
@@ -1232,7 +1155,6 @@ def main() -> None:
             "val_loss": val_stats["loss"],
             "val_iou": val_stats["iou"],
             "val_dice": val_stats["dice"],
-            "val_micro_dice": val_stats["micro_dice"],
             "val_pred_pos_ratio": val_stats["pred_pos_ratio"],
             "val_gt_pos_ratio": val_stats["gt_pos_ratio"],
             "val_threshold": epoch_best_threshold,
@@ -1244,7 +1166,6 @@ def main() -> None:
             f"train_loss={row['train_loss']:.6f} train_iou={row['train_iou']:.6f} train_dice={row['train_dice']:.6f} "
             f"train_pred_pos={row['train_pred_pos_ratio']:.6f} train_gt_pos={row['train_gt_pos_ratio']:.6f} "
             f"val_loss={row['val_loss']:.6f} val_iou={row['val_iou']:.6f} val_dice={row['val_dice']:.6f} "
-            f"val_micro_dice={row['val_micro_dice']:.6f} "
             f"val_pred_pos={row['val_pred_pos_ratio']:.6f} val_gt_pos={row['val_gt_pos_ratio']:.6f} "
             f"val_thr={row['val_threshold']:.2f}"
         )
@@ -1263,7 +1184,7 @@ def main() -> None:
             save_dir / "last.pt",
         )
 
-        sel_metric = row["val_micro_dice"] if use_micro_dice_sel else row["val_dice"]
+        sel_metric = row["val_dice"]
         if sel_metric > best_dice:
             best_dice = sel_metric
             best_threshold = epoch_best_threshold
@@ -1353,7 +1274,6 @@ def main() -> None:
         "loss": float(test_stats["loss"]),
         "iou": float(test_stats["iou"]),
         "dice": float(test_stats["dice"]),
-        "micro_dice": float(test_stats["micro_dice"]),
         "pred_pos_ratio": float(test_stats["pred_pos_ratio"]),
         "gt_pos_ratio": float(test_stats["gt_pos_ratio"]),
     }
@@ -1362,7 +1282,6 @@ def main() -> None:
         (
             f"best_epoch={summary['best_epoch']} best_threshold={summary['best_threshold']:.2f} "
             f"test_loss={summary['loss']:.6f} test_iou={summary['iou']:.6f} test_dice={summary['dice']:.6f} "
-            f"test_micro_dice={summary['micro_dice']:.6f} "
             f"test_pred_pos={summary['pred_pos_ratio']:.6f} test_gt_pos={summary['gt_pos_ratio']:.6f}\n"
         ),
         encoding="utf-8",
